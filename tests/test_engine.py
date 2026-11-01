@@ -46,35 +46,62 @@ def test_negative_fcf_skips_valuation():
     assert r["valuation"] == "N/A (negative FCF)"
 
 
-class FakeClient:
-    """Mimics the roicai client shape with canned data."""
-    def __init__(self, share_scale=1.0):
-        page = lambda items: NS(items=items)
-        yrs = range(2015, 2026)
-        self.tickers = NS(
-            search=lambda **k: page([NS(symbol="TST", exchange="NASDAQ", is_primary=True, name="Test Co")]),
-            retrieve=lambda i: NS(name="Test Co"))
-        prof = [NS(fiscal_year=y, return_on_inv_capital=25.0) for y in reversed(yrs)]
-        cfa = [NS(fiscal_year=y, cf_free_cash_flow=100.0 * 1.1 ** (y - 2015),
-                  free_cash_flow_per_sh=100.0 * 1.1 ** (y - 2015) / 10) for y in reversed(yrs)]
-        def cf_list(ident, period_type, **k):
-            if period_type == "ttm":
-                return page([NS(fiscal_year=2026, cf_free_cash_flow=270.0, free_cash_flow_per_sh=27.0)])
-            return page(cfa)
-        bs = NS(bs_cash_near_cash_item=50.0, bs_mkt_sec_other_st_invest=10.0, bs_st_borrow=20.0, bs_lt_borrow=80.0)
-        self.fundamentals = NS(
-            ratios=NS(profitability=NS(list=lambda *a, **k: page(prof))),
-            cash_flow_statements=NS(list=cf_list),
-            balance_sheets=NS(list=lambda *a, **k: page([bs])),
-            income_statements=NS(list=lambda *a, **k: page([NS(is_sh_for_diluted_eps=10.0 * share_scale,
-                                                               is_avg_num_sh_for_eps=10.0)])))
-        self.stock_prices = NS(latest=NS(retrieve=lambda i: NS(close=400.0)))
+def _fact(start, end, val, form="10-K", filed=None):
+    f = {"end": end, "val": val, "form": form, "filed": filed or end[:4] + "-12-31", "accn": "x"}
+    if start:
+        f["start"] = start
+    return f
 
 
-def test_fetch_and_analyze_end_to_end():
-    x = fetch(FakeClient(), "tst")
-    assert x.fcf == 270.0 and x.fcf_source == "TTM"
-    assert x.cash == 60.0 and x.debt == 100.0 and x.shares == 10.0 and x.price == 400.0
+def sec_fixture():
+    """Company with a Jan 31 fiscal year end, in SEC companyfacts JSON shape."""
+    g = {}
+    def add(concept, rows, unit="USD"):
+        g.setdefault(concept, {"units": {unit: []}})["units"][unit] += rows
+    for y in range(2015, 2027):          # FY ends Jan 31 of year y
+        s, e = f"{y-1}-02-01", f"{y}-01-31"
+        k = y - 2015
+        ocf, capex = 200 * 1.1 ** k, 50 * 1.1 ** k
+        dur = lambda c, v: add(c, [_fact(s, e, v)])
+        dur("NetCashProvidedByUsedInOperatingActivities", ocf)
+        dur("PaymentsToAcquirePropertyPlantAndEquipment", capex)
+        dur("OperatingIncomeLoss", 300.0)
+        dur("IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", 280.0)
+        dur("IncomeTaxExpenseBenefit", 56.0)    # 20% tax
+        add("WeightedAverageNumberOfDilutedSharesOutstanding", [_fact(s, e, 10.0)], unit="shares")
+        inst = lambda c, v: add(c, [_fact(None, e, v)])
+        inst("StockholdersEquity", 900.0)
+        inst("LongTermDebtNoncurrent", 80.0)
+        inst("LongTermDebtCurrent", 20.0)
+        inst("CashAndCashEquivalentsAtCarryingValue", 50.0)
+        inst("ShortTermInvestments", 10.0)
+    # noise that must be ignored: a quarterly 10-Q, and a restated older year from a later 10-K
+    add("NetCashProvidedByUsedInOperatingActivities", [_fact("2025-02-01", "2025-04-30", 999999, form="10-Q")])
+    add("OperatingIncomeLoss", [_fact("2015-02-01", "2016-01-31", 300.0, filed="2018-03-01")])
+    return {"cik": 1, "entityName": "Test Co", "facts": {"us-gaap": g}}
+
+
+class FakeSec:
+    contact = "me@example.com"
+    def lookup(self, t):
+        if t == "BAD":
+            raise LookupError("'BAD' isn't an SEC-registered US filer")
+        return 1, "Test Co"
+    def facts(self, cik):
+        return sec_fixture()
+
+
+def test_sec_parse_and_analyze_end_to_end():
+    from engine.data import parse_facts
+    yrs = parse_facts(sec_fixture())
+    assert sorted(yrs)[0] == 2015 and sorted(yrs)[-1] == 2026      # Jan FYE -> labelled by end year
+    y = yrs[2026]
+    assert round(y["fcf"], 2) == round(150 * 1.1 ** 11, 2)          # OCF - capex, 10-Q ignored
+    assert round(y["roic"], 2) == round(300 * 0.8 / (100 + 900) * 100, 2)   # 24.0%
+    assert y["cash"] == 60.0 and y["debt"] == 100.0 and y["shares"] == 10.0
+
+    x = fetch(FakeSec(), "tst", price_fn=lambda t, c: 400.0)
+    assert x.price == 400.0 and x.fcf_source == "FY2026"
     r = A.analyze(x)
     assert r["roic_test"] == "Pass" and r["erosion_test"] == "Pass"
     assert round(r["actual_fcf_cagr_5y"] * 100, 1) == 10.0
@@ -82,7 +109,16 @@ def test_fetch_and_analyze_end_to_end():
                               "Probably Overvalued", "Strongly Overvalued"}
 
 
-def test_share_unit_mismatch_is_rescaled():
-    x = fetch(FakeClient(share_scale=1e6), "tst")   # shares reported in raw units
-    assert abs(x.shares - 10.0) < 1e-9
-    assert "Share units auto-rescaled" in x.notes
+def test_price_override_and_negative_equity():
+    x = fetch(FakeSec(), "tst", price_override=123.0, price_fn=lambda t, c: 1 / 0)
+    assert x.price == 123.0 and "Price from your spreadsheet" in x.notes
+    from engine.data import parse_facts
+    fx = sec_fixture()
+    fx["facts"]["us-gaap"]["StockholdersEquity"]["units"]["USD"][-1]["val"] = -500.0  # buybacks
+    assert parse_facts(fx)[2026]["roic"] is None                    # blank -> flagged, not failed
+
+
+def test_unknown_ticker_raises():
+    import pytest
+    with pytest.raises(LookupError):
+        fetch(FakeSec(), "BAD")

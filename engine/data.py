@@ -1,123 +1,253 @@
-"""Pulls what the analysis needs from the official roic.ai API (pip: roicai).
+"""Free data: SEC EDGAR (financials) + Yahoo Finance / Stooq (price). No account or key.
 
-~7 API calls per stock. Needs a roic.ai plan with >= 11 years of history
-for the erosion test (Premium/Professional). On the free plan you'll get
-'Insufficient data' for the ROIC tests because history is capped at 2 years.
+SEC asks every visitor to identify themselves with a contact email in the
+request header — that's the only thing you need to provide.
+
+ROIC is computed from the raw 10-K filings:
+    NOPAT = operating income x (1 - income tax / pretax income)
+    Invested capital = total debt + shareholders' equity     (year-end)
+    ROIC = NOPAT / invested capital
+Cash is NOT subtracted from invested capital, so cash-rich companies aren't
+flattered (e.g. Veeva comes out ~10%, close to roic.ai's own figure).
+When equity is so negative that invested capital <= 0 (heavy buybacks),
+the year is left blank and flagged for manual review.
 """
 from __future__ import annotations
 
-from roicai import ApiError, Roicai
+import io
+import json
+import time
+import urllib.request
+from datetime import date
 
 from .analysis import Inputs
 
-US_EXCHANGES = ["NASDAQ", "NYSE", "NYSE ARCA", "NYSEARCA", "AMEX", "NYSE AMERICAN", "BATS", "CBOE"]
+SEC_TICKERS = "https://www.sec.gov/files/company_tickers.json"
+SEC_FACTS = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
+
+# First concept found wins. Order = preference.
+CONCEPTS = {
+    "ocf": ["NetCashProvidedByUsedInOperatingActivities",
+            "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"],
+    "capex": ["PaymentsToAcquirePropertyPlantAndEquipment",
+              "PaymentsToAcquireProductiveAssets",
+              "PaymentsForCapitalImprovements",
+              "PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets"],
+    "ebit": ["OperatingIncomeLoss"],
+    "pretax": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+               "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+               "IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic"],
+    "tax": ["IncomeTaxExpenseBenefit"],
+    "net_income": ["NetIncomeLoss", "ProfitLoss"],
+    "interest": ["InterestExpense", "InterestExpenseNonoperating", "InterestExpenseDebt"],
+    "equity": ["StockholdersEquity",
+               "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+    "cash": ["CashAndCashEquivalentsAtCarryingValue",
+             "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "Cash"],
+    "st_inv": ["ShortTermInvestments", "MarketableSecuritiesCurrent",
+               "AvailableForSaleSecuritiesDebtSecuritiesCurrent", "OtherShortTermInvestments"],
+    "debt_total": ["LongTermDebt", "DebtLongtermAndShorttermCombinedAmount"],
+    "debt_noncurrent": ["LongTermDebtNoncurrent", "LongTermDebtAndCapitalLeaseObligations",
+                        "LongTermDebtAndFinanceLeaseLiabilitiesNoncurrent", "LongTermNotesPayable",
+                        "SeniorLongTermNotes", "ConvertibleNotesPayableNoncurrent"],
+    "debt_current": ["LongTermDebtCurrent", "LongTermDebtAndCapitalLeaseObligationsCurrent",
+                     "ConvertibleNotesPayableCurrent"],
+    "debt_current_all": ["DebtCurrent"],
+    "st_borrow": ["ShortTermBorrowings", "CommercialPaper"],
+    "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+}
+DURATION = {"ocf", "capex", "ebit", "pretax", "tax", "net_income", "interest", "shares_diluted"}
 
 
-def _items(pager):
-    return list(getattr(pager, "items", None) or [])
-
-
-def _num(v):
-    try:
-        return None if v is None else float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def resolve(client: Roicai, ticker: str) -> tuple[str, str]:
-    """Bare 'AAPL' -> ('NASDAQ:AAPL', 'Apple Inc.'). 'NYSE:LOW' passes through."""
-    t = ticker.strip().upper()
-    if ":" in t:
+# ---- HTTP ------------------------------------------------------------------
+def _get(url: str, contact: str, timeout=30) -> bytes:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": f"MoatScreener/2.0 {contact}", "Accept-Encoding": "identity"})
+    for attempt in range(3):
         try:
-            info = client.tickers.retrieve(t)
-            return t, getattr(info, "name", "") or ""
-        except ApiError:
-            return t, ""
-    res = _items(client.tickers.search(query=t, search_by="symbol", limit=10))
-    exact = [r for r in res if (r.symbol or "").upper() == t]
-    if not exact:
-        raise LookupError(f"roic.ai has no ticker '{t}'")
-    def rank(r):
-        ex = (r.exchange or "").upper()
-        return (0 if ex in US_EXCHANGES else 1, 0 if r.is_primary else 1)
-    best = sorted(exact, key=rank)[0]
-    return f"{best.exchange}:{best.symbol}", best.name or ""
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 503) and attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError("unreachable")
 
 
-def fetch(client: Roicai, ticker: str) -> Inputs:
-    ident, name = resolve(client, ticker)
-    x = Inputs(ticker=ticker.strip().upper(), name=name)
+class SecClient:
+    """Thin SEC client. Respects SEC's 10 requests/second limit."""
+    def __init__(self, contact: str, getter=_get):
+        if "@" not in (contact or ""):
+            raise ValueError("SEC requires a contact email")
+        self.contact, self._get, self._last = contact, getter, 0.0
+        self._tickers = None
 
-    # ROIC history (percent values, e.g. 46.9)
-    prof = _items(client.fundamentals.ratios.profitability.list(
-        ident, period_type="annual", order="desc", limit=12))
-    x.roic_by_year = {p.fiscal_year: _num(p.return_on_inv_capital) for p in prof if p.fiscal_year}
+    def _fetch_json(self, url):
+        wait = 0.12 - (time.time() - self._last)
+        if wait > 0:
+            time.sleep(wait)
+        self._last = time.time()
+        return json.loads(self._get(url, self.contact))
 
-    # FCF history (annual) + latest FCF (TTM preferred)
-    cfa = _items(client.fundamentals.cash_flow_statements.list(
-        ident, period_type="annual", order="desc", limit=12))
-    x.fcf_by_year = {c.fiscal_year: _num(c.cf_free_cash_flow) for c in cfa if c.fiscal_year}
-    latest_cf = cfa[0] if cfa else None
-    try:
-        ttm = _items(client.fundamentals.cash_flow_statements.list(
-            ident, period_type="ttm", order="desc", limit=1))
-        if ttm and _num(ttm[0].cf_free_cash_flow) is not None:
-            latest_cf, x.fcf_source = ttm[0], "TTM"
-    except ApiError:
-        pass
-    if latest_cf is not None:
-        x.fcf = _num(latest_cf.cf_free_cash_flow)
-        x.fcf_source = x.fcf_source or f"FY{latest_cf.fiscal_year}"
+    def lookup(self, ticker: str):
+        if self._tickers is None:
+            raw = self._fetch_json(SEC_TICKERS)
+            self._tickers = {v["ticker"].upper(): (int(v["cik_str"]), v["title"]) for v in raw.values()}
+        t = ticker.upper().split(":")[-1].replace(".", "-")
+        if t not in self._tickers:
+            raise LookupError(f"'{ticker}' isn't an SEC-registered US filer")
+        return self._tickers[t]
 
-    # Cash & debt: latest quarter if the plan allows, else latest fiscal year
-    bs = None
-    for ptype in ("quarterly", "annual"):
-        try:
-            got = _items(client.fundamentals.balance_sheets.list(
-                ident, period_type=ptype, order="desc", limit=1))
-            if got:
-                bs = got[0]
-                break
-        except ApiError:
+    def facts(self, cik: int):
+        return self._fetch_json(SEC_FACTS.format(cik=cik))
+
+
+# ---- parsing SEC XBRL facts --------------------------------------------------
+def _d(s):
+    return date.fromisoformat(s)
+
+
+def _annual_series(facts: dict, concept: str, duration: bool) -> dict[date, float]:
+    """{period end date: value} from 10-K filings; latest filing wins for restatements."""
+    node = facts.get("facts", {}).get("us-gaap", {}).get(concept)
+    if not node:
+        return {}
+    unit = "shares" if concept.startswith("WeightedAverage") else "USD"
+    out, filed = {}, {}
+    for f in node.get("units", {}).get(unit, []):
+        if not str(f.get("form", "")).startswith("10-K"):
             continue
-    if bs is not None:
-        x.cash = (_num(bs.bs_cash_near_cash_item) or 0) + (_num(bs.bs_mkt_sec_other_st_invest) or 0)
-        x.debt = (_num(bs.bs_st_borrow) or 0) + (_num(bs.bs_lt_borrow) or 0)
+        if duration:
+            if "start" not in f:
+                continue
+            days = (_d(f["end"]) - _d(f["start"])).days
+            if not 350 <= days <= 380:
+                continue
+        end = _d(f["end"])
+        if end not in filed or f.get("filed", "") >= filed[end]:
+            out[end], filed[end] = float(f["val"]), f.get("filed", "")
+    return out
 
-    # Diluted shares (latest fiscal year)
-    inc = _items(client.fundamentals.income_statements.list(
-        ident, period_type="annual", order="desc", limit=1))
-    if inc:
-        x.shares = _num(inc[0].is_sh_for_diluted_eps) or _num(inc[0].is_avg_num_sh_for_eps)
 
-    # Unit safety net: shares and dollar amounts must be in the same scale.
-    # Cross-check against roic.ai's own FCF-per-share; rescale by 1000s if off.
-    if x.shares and latest_cf is not None:
-        fps = _num(getattr(latest_cf, "free_cash_flow_per_sh", None))
-        f = _num(latest_cf.cf_free_cash_flow)
-        if fps and f and fps * f > 0:
-            ratio = (f / x.shares) / fps
-            for k in (1e-9, 1e-6, 1e-3, 1e3, 1e6, 1e9):
-                if 0.5 * k < ratio < 2 * k:
-                    x.shares *= k
-                    x.notes.append("Share units auto-rescaled")
-                    break
+def _pick(facts, key):
+    for c in CONCEPTS[key]:
+        s = _annual_series(facts, c, key in DURATION)
+        if s:
+            return s
+    return {}
 
-    x.price = _num(client.stock_prices.latest.retrieve(ident).close)
+
+def _near(series: dict[date, float], target: date, tol=10):
+    best = None
+    for d, v in series.items():
+        if abs((d - target).days) <= tol and (best is None or abs((d - target).days) < best[0]):
+            best = (abs((d - target).days), v)
+    return None if best is None else best[1]
+
+
+def parse_facts(facts: dict) -> dict:
+    """Return per-fiscal-year metrics keyed by fiscal year (year of the FY end date)."""
+    s = {k: _pick(facts, k) for k in CONCEPTS}
+    fy_ends = sorted(set(s["ocf"]) | set(s["ebit"]))
+    years = {}
+    for end in fy_ends:
+        g = lambda k: _near(s[k], end)
+        ocf, capex = g("ocf"), g("capex")
+        fcf = None if ocf is None else ocf - abs(capex or 0)
+
+        # debt: prefer components, fall back to totals
+        noncur, cur, cur_all, stb, tot = (g("debt_noncurrent"), g("debt_current"),
+                                         g("debt_current_all"), g("st_borrow"), g("debt_total"))
+        if cur_all is not None:
+            current = cur_all                      # DebtCurrent already includes ST borrowings
+        else:
+            current = (cur or 0) + (stb or 0)
+        if noncur is not None:
+            debt = noncur + current
+        elif tot is not None:                      # LongTermDebt includes its current portion
+            debt = tot + (stb or 0)
+        else:
+            debt = current
+
+        ebit, pretax, tax, eq = g("ebit"), g("pretax"), g("tax"), g("equity")
+        if ebit is None and pretax is not None:    # some filers don't tag operating income
+            ebit = pretax + (g("interest") or 0)
+        roic = None
+        if ebit is not None and eq is not None:
+            rate = (tax / pretax) if (tax is not None and pretax and pretax > 0) else 0.21
+            rate = min(max(rate, 0.0), 0.5)        # clamp one-offs (e.g. 2017 Tax Act)
+            ic = debt + eq
+            if ic > 0:
+                roic = ebit * (1 - rate) / ic * 100
+        years[end.year] = {
+            "end": end, "fcf": fcf, "capex_missing": capex is None, "roic": roic,
+            "cash": (g("cash") or 0) + (g("st_inv") or 0), "debt": debt,
+            "shares": g("shares_diluted"), "equity": eq,
+        }
+    return years
+
+
+# ---- prices ------------------------------------------------------------------
+def price_yahoo(ticker: str):
+    import yfinance as yf
+    p = yf.Ticker(ticker.replace(".", "-")).fast_info.get("last_price")
+    return float(p) if p else None
+
+
+def price_stooq(ticker: str, contact: str = ""):
+    raw = _get(f"https://stooq.com/q/l/?s={ticker.lower().replace('.', '-')}.us&f=sd2t2ohlcv&h&e=csv",
+               contact).decode()
+    rows = list(__import__("csv").DictReader(io.StringIO(raw)))
+    c = rows[0].get("Close") if rows else None
+    return float(c) if c not in (None, "", "N/D") else None
+
+
+def get_price(ticker: str, contact: str):
+    for fn in (lambda: price_yahoo(ticker), lambda: price_stooq(ticker, contact)):
+        try:
+            p = fn()
+            if p:
+                return p
+        except Exception:
+            continue
+    return None
+
+
+# ---- main entry --------------------------------------------------------------
+def fetch(sec: SecClient, ticker: str, price_override: float | None = None, price_fn=None) -> Inputs:
+    t = ticker.strip().upper().split(":")[-1]
+    cik, name = sec.lookup(t)
+    facts = sec.facts(cik)
+    yrs = parse_facts(facts)
+    x = Inputs(ticker=t, name=name)
+    if not yrs:
+        x.notes.append("No US-GAAP annual data in SEC filings (foreign or non-standard filer)")
+        return x
+    recent = sorted(yrs)[-11:]
+    x.roic_by_year = {y: yrs[y]["roic"] for y in recent}
+    x.fcf_by_year = {y: yrs[y]["fcf"] for y in recent}
+    last = yrs[recent[-1]]
+    x.fcf, x.fcf_source = last["fcf"], f"FY{recent[-1]}"
+    x.cash, x.debt, x.shares = last["cash"], last["debt"], last["shares"]
+    if last["capex_missing"]:
+        x.notes.append("Capex not found in filings — FCF may be overstated")
+    if last["shares"] is None:
+        x.notes.append("Diluted share count not found")
+    if (date.today() - last["end"]).days > 550:
+        x.notes.append(f"Latest 10-K is old (FY ending {last['end']})")
+    x.price = price_override if price_override else (price_fn or get_price)(t, sec.contact)
+    if price_override:
+        x.notes.append("Price from your spreadsheet")
+    elif x.price is None:
+        x.notes.append("Couldn't fetch price — add a Price column to your spreadsheet")
     return x
 
 
-def make_client(api_key: str) -> Roicai:
-    return Roicai(api_key=api_key, max_retries=4, timeout=60,
-                  app_info={"name": "moat-screener", "version": "2.0"})
-
-
 def friendly_error(e: Exception) -> str:
-    code = getattr(e, "status_code", None)
-    return {
-        401: "API key invalid",
-        402: "Your roic.ai plan doesn't include this data",
-        403: "Your roic.ai plan's history limit blocks this request",
-        404: "Ticker not found on roic.ai",
-        429: "Rate limit hit — try again shortly",
-    }.get(code, str(e)[:120])
+    code = getattr(e, "code", None)
+    if code == 403:
+        return "SEC blocked the request — check the contact email in the sidebar"
+    if code == 404:
+        return "No SEC financial data for this company"
+    return str(e)[:150]

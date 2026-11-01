@@ -6,72 +6,73 @@ from __future__ import annotations
 
 import io
 import os
-import time
 
 import pandas as pd
 import streamlit as st
 
 from engine import analysis as A
-from engine.data import fetch, friendly_error, make_client
+from engine.data import SecClient, fetch, friendly_error
 
 st.set_page_config(page_title="Moat Screener", page_icon="📈", layout="wide")
 st.title("Moat Screener")
 st.caption(f"ROIC 7-yr avg ≥ {A.ROIC_AVG_MIN:.0f}% · Erosion: recent 5-yr avg ≥ "
-           f"{A.EROSION_RATIO_MIN:.0%} of prior 5 · DCF at {A.DISCOUNT:.0%} · Data: roic.ai")
+           f"{A.EROSION_RATIO_MIN:.0%} of prior 5 · DCF at {A.DISCOUNT:.0%} · "
+           "Data: SEC filings + Yahoo Finance (free)")
 
-# ---- sidebar: API key ------------------------------------------------------
-def _secret_key():
+
+def _secret(name):
     try:
-        return st.secrets.get("ROICAI_API_KEY", "")
+        return st.secrets.get(name, "")
     except Exception:
         return ""
 
+
 with st.sidebar:
-    st.header("roic.ai API key")
-    default_key = os.environ.get("ROICAI_API_KEY") or _secret_key()
-    api_key = st.text_input("API key", value=default_key, type="password",
-                            help="Find it at roic.ai → API Key. Stored only in this session.")
-    st.caption("Needs a plan with 10+ years of history (e.g. Premium) for the ROIC tests. "
-               "On the free plan they'll show 'Insufficient data'.")
-    pause = st.number_input("Pause between stocks (sec)", 0.0, 30.0, 0.0, 0.5,
-                            help="Raise this if you hit rate limits (free plan: ~15).")
+    st.header("Setup")
+    contact = st.text_input("Your email", value=os.environ.get("SEC_CONTACT") or _secret("SEC_CONTACT"),
+                            help="The SEC asks anyone using its free data to identify themselves "
+                                 "with an email. It's only sent to sec.gov.")
+    st.caption("No account or payment needed. Financials come from companies' 10-K filings "
+               "on SEC EDGAR; prices from Yahoo Finance.")
 
 # ---- upload ----------------------------------------------------------------
 up = st.file_uploader("Upload a spreadsheet of tickers (.csv or .xlsx)", type=["csv", "xlsx", "xls"])
 st.caption("Put tickers in a column named **Ticker** or **Symbol** (otherwise the first column is used). "
-           "Use `EXCHANGE:SYMBOL` (e.g. `NYSE:LOW`) if a bare ticker resolves to the wrong listing.")
+           "Optional: add a **Price** column to use your own prices instead of fetching them.")
 
 
-def read_tickers(file) -> list[str]:
+def read_tickers(file) -> tuple[list[str], dict]:
     df = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
-    cols = {c.lower().strip(): c for c in df.columns.astype(str)}
+    cols = {str(c).lower().strip(): c for c in df.columns}
     col = cols.get("ticker") or cols.get("symbol") or df.columns[0]
-    vals = df[col].dropna().astype(str).str.strip().str.upper()
-    vals = vals[vals.str.len().between(1, 20)]
-    return list(dict.fromkeys(vals))  # de-dupe, keep order
+    df = df.dropna(subset=[col])
+    df["_t"] = df[col].astype(str).str.strip().str.upper()
+    df = df[df["_t"].str.len().between(1, 20)].drop_duplicates("_t")
+    prices = {}
+    if "price" in cols:
+        p = pd.to_numeric(df[cols["price"]], errors="coerce")
+        prices = {t: float(v) for t, v in zip(df["_t"], p) if pd.notna(v) and v > 0}
+    return list(df["_t"]), prices
 
 
-tickers = read_tickers(up) if up else []
+tickers, price_overrides = read_tickers(up) if up else ([], {})
 if tickers:
     st.write(f"**{len(tickers)} tickers:** " + ", ".join(tickers[:40]) + (" …" if len(tickers) > 40 else ""))
 
-run = st.button("Run analysis", type="primary", disabled=not (tickers and api_key))
+run = st.button("Run analysis", type="primary", disabled=not (tickers and "@" in (contact or "")))
+if tickers and "@" not in (contact or ""):
+    st.info("Enter your email in the sidebar to run.")
 
 if run:
-    client = make_client(api_key)
+    sec = SecClient(contact)
     rows, bar, status = [], st.progress(0.0), st.empty()
     for i, t in enumerate(tickers, 1):
         status.write(f"Analyzing **{t}** ({i}/{len(tickers)})…")
         try:
-            rows.append(A.analyze(fetch(client, t)))
+            rows.append(A.analyze(fetch(sec, t, price_overrides.get(t))))
         except Exception as e:  # one bad ticker never stops the run
             rows.append({"ticker": t, "valuation": "Error", "notes": [friendly_error(e)]})
-            if getattr(e, "status_code", None) == 401:
-                st.error("roic.ai rejected the API key. Check it in the sidebar.")
-                break
         bar.progress(i / len(tickers))
-        if pause and i < len(tickers):
-            time.sleep(pause)
     status.write(f"Done — {len(rows)} stocks analyzed.")
     st.session_state["results"] = rows
     st.session_state["run_at"] = pd.Timestamp.now().strftime("%b %d, %Y %I:%M %p")
