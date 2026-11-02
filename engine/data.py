@@ -32,7 +32,9 @@ CONCEPTS = {
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment",
               "PaymentsToAcquireProductiveAssets",
               "PaymentsForCapitalImprovements",
-              "PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets"],
+              "PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets",
+              "PaymentsToAcquireOtherPropertyPlantAndEquipment",
+              "PaymentsForProceedsFromProductiveAssets"],
     "ebit": ["OperatingIncomeLoss"],
     "pretax": ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
                "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
@@ -41,7 +43,10 @@ CONCEPTS = {
     "net_income": ["NetIncomeLoss", "ProfitLoss"],
     "interest": ["InterestExpense", "InterestExpenseNonoperating", "InterestExpenseDebt"],
     "equity": ["StockholdersEquity",
-               "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
+               "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+               "PartnersCapital",                      # MLPs (e.g. EPD)
+               "PartnersCapitalIncludingPortionAttributableToNoncontrollingInterest",
+               "MembersEquity"],
     "cash": ["CashAndCashEquivalentsAtCarryingValue",
              "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents", "Cash"],
     "st_inv": ["ShortTermInvestments", "MarketableSecuritiesCurrent",
@@ -54,7 +59,10 @@ CONCEPTS = {
                      "ConvertibleNotesPayableCurrent"],
     "debt_current_all": ["DebtCurrent"],
     "st_borrow": ["ShortTermBorrowings", "CommercialPaper"],
-    "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+    "shares_diluted": ["WeightedAverageNumberOfDilutedSharesOutstanding",
+                       "WeightedAverageLimitedPartnershipUnitsOutstandingDiluted",
+                       "WeightedAverageNumberOfShareOutstandingBasicAndDiluted",
+                       "WeightedAverageLimitedPartnershipUnitsOutstanding"],
 }
 DURATION = {"ocf", "capex", "ebit", "pretax", "tax", "net_income", "interest", "shares_diluted"}
 
@@ -131,11 +139,14 @@ def _annual_series(facts: dict, concept: str, duration: bool) -> dict[date, floa
 
 
 def _pick(facts, key):
+    """Merge all candidate concepts: companies often switch tags between years,
+    so for each period use the most-preferred concept that has a value."""
+    merged = {}
     for c in CONCEPTS[key]:
-        s = _annual_series(facts, c, key in DURATION)
-        if s:
-            return s
-    return {}
+        for d, v in _annual_series(facts, c, key in DURATION).items():
+            if not any(abs((d - m).days) <= 10 for m in merged):
+                merged[d] = v
+    return merged
 
 
 def _near(series: dict[date, float], target: date, tol=10):
@@ -144,6 +155,45 @@ def _near(series: dict[date, float], target: date, tol=10):
         if abs((d - target).days) <= tol and (best is None or abs((d - target).days) < best[0]):
             best = (abs((d - target).days), v)
     return None if best is None else best[1]
+
+
+def _cover_shares(facts: dict):
+    """Shares outstanding from the most recent 10-K/10-Q cover page (dei).
+    Multi-class companies report one row per class on the same date, so sum them."""
+    node = facts.get("facts", {}).get("dei", {}).get("EntityCommonStockSharesOutstanding")
+    if not node:
+        return None
+    rows = [f for f in node.get("units", {}).get("shares", []) if f.get("val")]
+    if not rows:
+        return None
+    latest = max(rows, key=lambda f: (f.get("filed", ""), f.get("end", "")))
+    same = [f for f in rows if f.get("accn") == latest.get("accn") and f.get("end") == latest.get("end")]
+    return float(sum({f["val"] for f in same})) or None
+
+
+SPLIT_RATIOS = (2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50)
+
+
+def _split_ratio(shares, cover):
+    """If cover-page count / diluted count looks like a clean stock split, return it."""
+    if not shares or not cover:
+        return None
+    r = cover / shares
+    for k in SPLIT_RATIOS:
+        for target in (k, 1 / k):
+            if abs(r / target - 1) <= 0.08:
+                return target
+    return None
+
+
+def _fix_scale(value, reference):
+    """Rescale value by powers of 1000 so it's within ~3x of reference."""
+    if not value or not reference:
+        return value, False
+    for k in (1.0, 1e3, 1e6, 1e9, 1e-3, 1e-6, 1e-9):
+        if reference / 3 <= value * k <= reference * 3:
+            return value * k, k != 1.0
+    return value, False
 
 
 def parse_facts(facts: dict) -> dict:
@@ -272,13 +322,28 @@ def fetch(sec: SecClient, ticker: str, price_override: float | None = None, pric
     recent = sorted(yrs)[-11:]
     x.roic_by_year = {y: yrs[y]["roic"] for y in recent}
     x.fcf_by_year = {y: yrs[y]["fcf"] for y in recent}
+    x.detail = {y: {k: (round(v, 1) if isinstance(v, float) else v)
+                    for k, v in yrs[y].items() if k not in ("end", "capex_missing")} for y in recent}
     last = yrs[recent[-1]]
     x.fcf, x.fcf_source = last["fcf"], f"FY{recent[-1]}"
     x.cash, x.debt, x.shares = last["cash"], last["debt"], last["shares"]
     if last["capex_missing"]:
         x.notes.append("Capex not found in filings — FCF may be overstated")
-    if last["shares"] is None:
-        x.notes.append("Diluted share count not found")
+    cover = _cover_shares(facts)
+    if x.shares is None and cover:
+        x.shares = cover
+        x.notes.append("Used cover-page share count (diluted count not tagged)")
+    else:
+        x.shares, fixed = _fix_scale(x.shares, cover)
+        if fixed:
+            x.notes.append("Share count scale error in SEC filing — auto-corrected")
+        split = _split_ratio(x.shares, cover)
+        if split:
+            x.shares = cover
+            label = f"{split:g}-for-1" if split > 1 else f"1-for-{1 / split:g} reverse"
+            x.notes.append(f"Stock split since last 10-K ({label}) — used latest share count")
+    if x.shares is None:
+        x.notes.append("Share count not found")
     if (date.today() - last["end"]).days > 550:
         x.notes.append(f"Latest 10-K is old (FY ending {last['end']})")
     if price_override:
@@ -289,6 +354,17 @@ def fetch(sec: SecClient, ticker: str, price_override: float | None = None, pric
         x.price, info = got if isinstance(got, tuple) else (got, "")
         if x.price is None:
             x.notes.append(f"Price fetch failed ({info}) — add a Price column to your spreadsheet")
+    # Last-resort sanity check: price / FCF-per-share should be plausible (2x-500x)
+    if x.price and x.shares and x.fcf and x.fcf > 0:
+        pfcf = x.price / (x.fcf / x.shares)
+        if not 2 <= pfcf <= 500:
+            for k in (1e3, 1e6, 1e9, 1e-3, 1e-6, 1e-9):
+                if 2 <= pfcf * k <= 500:
+                    x.shares *= k
+                    x.notes.append("Share count looked mis-scaled vs. price — auto-corrected")
+                    break
+            else:
+                x.notes.append(f"Check data: price is {pfcf:,.0f}x FCF per share")
     return x
 
 

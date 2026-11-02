@@ -128,13 +128,14 @@ class Inputs:
     roic_by_year: dict = field(default_factory=dict)
     fcf_by_year: dict = field(default_factory=dict)
     notes: list = field(default_factory=list)
+    detail: dict = field(default_factory=dict)
 
 
 def analyze(x: Inputs) -> dict:
     row = {"ticker": x.ticker, "name": x.name, "price": x.price, "notes": list(x.notes),
            "roic_history": dict(sorted(x.roic_by_year.items())),
            "fcf_history": dict(sorted(x.fcf_by_year.items())),
-           "cash": x.cash, "debt": x.debt, "shares": x.shares}
+           "cash": x.cash, "debt": x.debt, "shares": x.shares, "by_year": x.detail}
     row.update(roic_test(x.roic_by_year) if x.roic_by_year else
                {"roic_test": "Insufficient data", "roic_7yr_avg": None})
     row.update(erosion_test(x.roic_by_year) if x.roic_by_year else
