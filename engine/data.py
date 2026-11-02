@@ -189,29 +189,74 @@ def parse_facts(facts: dict) -> dict:
 
 
 # ---- prices ------------------------------------------------------------------
-def price_yahoo(ticker: str):
-    import yfinance as yf
-    p = yf.Ticker(ticker.replace(".", "-")).fast_info.get("last_price")
-    return float(p) if p else None
+# Free quote sources often block cloud servers, so we try several in turn and
+# remember which one works for the rest of the run.
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
 
-def price_stooq(ticker: str, contact: str = ""):
-    raw = _get(f"https://stooq.com/q/l/?s={ticker.lower().replace('.', '-')}.us&f=sd2t2ohlcv&h&e=csv",
-               contact).decode()
+def _web(url: str, timeout=15) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA, "Accept": "*/*",
+                                               "Accept-Language": "en-US,en;q=0.9"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def price_yahoo_chart(t: str):
+    for host in ("query1", "query2"):
+        try:
+            d = json.loads(_web(f"https://{host}.finance.yahoo.com/v8/finance/chart/{t}?range=5d&interval=1d"))
+            p = d["chart"]["result"][0]["meta"].get("regularMarketPrice")
+            if p:
+                return float(p)
+        except Exception as e:
+            err = e
+    raise err
+
+
+def price_nasdaq(t: str):
+    d = json.loads(_web(f"https://api.nasdaq.com/api/quote/{t}/info?assetclass=stocks"))
+    s = (d.get("data") or {}).get("primaryData", {}).get("lastSalePrice", "")
+    return float(s.replace("$", "").replace(",", "")) if s else None
+
+
+def price_stooq(t: str):
+    raw = _web(f"https://stooq.com/q/l/?s={t.lower()}.us&f=sd2t2ohlcv&h&e=csv").decode()
     rows = list(__import__("csv").DictReader(io.StringIO(raw)))
     c = rows[0].get("Close") if rows else None
     return float(c) if c not in (None, "", "N/D") else None
 
 
-def get_price(ticker: str, contact: str):
-    for fn in (lambda: price_yahoo(ticker), lambda: price_stooq(ticker, contact)):
+def price_yfinance(t: str):
+    import yfinance as yf
+    p = yf.Ticker(t).fast_info.get("last_price")
+    return float(p) if p else None
+
+
+PRICE_SOURCES = [("Yahoo", price_yahoo_chart), ("Nasdaq", price_nasdaq),
+                 ("Stooq", price_stooq), ("yfinance", price_yfinance)]
+_preferred = []   # source that worked last time goes first
+
+
+def _short(e):
+    return str(getattr(e, "code", "") or type(e).__name__)
+
+
+def get_price(ticker: str, contact: str = ""):
+    """Returns (price, source) or (None, 'why each source failed')."""
+    t = ticker.upper().replace(".", "-")
+    order = _preferred + [s for s in PRICE_SOURCES if s not in _preferred]
+    errors = []
+    for name, fn in order:
         try:
-            p = fn()
-            if p:
-                return p
-        except Exception:
-            continue
-    return None
+            p = fn(t)
+            if p and p > 0:
+                _preferred[:] = [(name, fn)]
+                return p, name
+            errors.append(f"{name}: no data")
+        except Exception as e:
+            errors.append(f"{name}: {_short(e)}")
+    return None, "; ".join(errors)
 
 
 # ---- main entry --------------------------------------------------------------
@@ -236,11 +281,14 @@ def fetch(sec: SecClient, ticker: str, price_override: float | None = None, pric
         x.notes.append("Diluted share count not found")
     if (date.today() - last["end"]).days > 550:
         x.notes.append(f"Latest 10-K is old (FY ending {last['end']})")
-    x.price = price_override if price_override else (price_fn or get_price)(t, sec.contact)
     if price_override:
+        x.price = price_override
         x.notes.append("Price from your spreadsheet")
-    elif x.price is None:
-        x.notes.append("Couldn't fetch price — add a Price column to your spreadsheet")
+    else:
+        got = (price_fn or get_price)(t, sec.contact)
+        x.price, info = got if isinstance(got, tuple) else (got, "")
+        if x.price is None:
+            x.notes.append(f"Price fetch failed ({info}) — add a Price column to your spreadsheet")
     return x
 
 
